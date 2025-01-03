@@ -1,0 +1,17 @@
+[package]
+name = "teensy4-bsp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rtic = "1.1.4"
+imxrt-hal = { git = "https://github.com/imxrt-rs/imxrt-hal", version = "0.6.0", features = ["imxrt1060", "defmt"] }
+imxrt-ral = { version = "0.6", features = ["imxrt1062", "rt"] }
+imxrt-rt = { version = "0.1.5", features = ["device"] }
+teensy4-fcb = "0.4.0"
+teensy4-panic = "0.2.3"
+teensy4-pins = { path = "../teensy4-pins" }
+
+[build-dependencies]
+imxrt-rt = { version = "0.1.5", features = ["device"] }

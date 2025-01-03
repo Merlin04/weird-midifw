@@ -1,0 +1,9 @@
+[workspace]
+
+resolver = "2"
+members = [
+    "fw",
+    "teensy4-bsp",
+    "teensy4-pins",
+    "usbd-serial"
+, "teensy4-pins"]
