@@ -22,6 +22,9 @@ usbd-midi = "0.3.0"
 # imxrt-ral = { version = "0.6", features = ["imxrt1062"] }
 imxrt-usbd = "0.3.0"
 teensy4-bsp = { path = "../teensy4-bsp" }
+embedded-hal = "1.0.0"
+static_cell = "2.1.0"
+critical-section = "1.2.0"
 
 # Don't optimize build dependencies, like proc macros.
 # Helps with build times.

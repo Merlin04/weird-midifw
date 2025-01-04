@@ -11,6 +11,8 @@
 #![no_std]
 #![no_main]
 
+mod hardware;
+
 use core::arch::asm;
 use teensy4_bsp::ral;
 
@@ -44,10 +46,13 @@ fn reboot_into_bootloader() -> ! {
 
 #[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [KPP])]
 mod app {
-    use teensy4_bsp::hal::usbd::{
+    use critical_section::Mutex;
+    use crate::hardware::i2c_mp::I2cBankBus;
+    use static_cell::StaticCell;
+    use teensy4_bsp::{board::{lpi2c, Lpi2c3}, hal::usbd::{
         gpt::{Instance::Gpt0, Mode},
         BusAdapter, EndpointMemory, EndpointState, Speed
-    };
+    }};
     // use teensy4_bsp as bsp;
     use teensy4_bsp::board;
 
@@ -63,9 +68,9 @@ mod app {
     use rtic_monotonics::systick::{Systick, *};
 
     // sure
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::{cell::RefCell, sync::atomic::{AtomicU32, Ordering}};
 
-    use crate::reboot_into_bootloader;
+    use crate::{hardware::{encoder::EncoderAS5600, i2c_mp::{I2cBank, I2cBus, MultiplexedI2c}}, reboot_into_bootloader};
     static COUNT: AtomicU32 = AtomicU32::new(0);
     defmt::timestamp!("{=u32:us}", COUNT.fetch_add(1, Ordering::Relaxed));
 
@@ -90,7 +95,56 @@ mod app {
         usb_device: UsbDevice<'static, BusAdapter>,
         defmt_consumer: DefmtConsumer,
         led: board::Led,
+        ctrl_enc: EncoderAS5600<Lpi2c3>,
+        param_encs: [EncoderAS5600<Lpi2c3>; 4]
     }
+
+    // struct UnsafeRefCell<T>(core::cell::RefCell<T>);
+    // unsafe impl<T> Send for UnsafeRefCell<T> {}
+    // unsafe impl<T> Sync for UnsafeRefCell<T> {}    
+    // impl<T> core::ops::Deref for UnsafeRefCell<T> {
+    //     type Target = RefCell<T>;
+    //     fn deref(&self) -> &Self::Target {
+    //         &self.0
+    //     }
+    // }
+
+    // struct StaticRefCell<T>(core::cell::RefCell<Option<T>>);
+    // impl<T> StaticRefCell<T> {
+    //     pub fn new() -> StaticRefCell<T> {
+    //         StaticRefCell(RefCell::new(None))
+    //     }
+    //     pub fn init(&self, v: T) {
+    //         self.0.replace(Some(v));
+    //     }
+    // }
+    // impl<T> core::ops::Deref for StaticRefCell<T> {
+    //     type Target = core::cell::RefCell<T>;
+    //     fn deref(&self) -> &Self::Target {
+
+    //     }
+    // }
+
+    // struct MaybeUninitSyncUnsafe<T>(MaybeUninit<T>);
+    // unsafe impl<T> Sync for MaybeUninitSyncUnsafe<T> {}
+    // impl<T> core::ops::Deref for MaybeUninitSyncUnsafe<T> {
+    //     type Target = MaybeUninit<T>;
+    //     fn deref(&self) -> &Self::Target {
+    //         &self.0
+    //     }
+    // }
+    // impl<T> core::ops::DerefMut for MaybeUninitSyncUnsafe<T> {
+    //     fn deref_mut(&mut self) -> &mut Self::Target {
+    //         &mut self.0
+    //     }
+    // }
+
+
+    // static mut MI2C_VAL: MaybeUninitSyncUnsafe<Mutex<MultiplexedI2c<Lpi2c3>>> = MaybeUninitSyncUnsafe(MaybeUninit::uninit());
+    // static mi2c: Onc<Option<MultiplexedI2c<Lpi2c3>>> = UnsafeRefCell(RefCell::new(None));
+
+    // static mut MI2C_VAL: OnceCell<Mutex<MultiplexedI2c<Lpi2c3>>> = OnceCell::new();
+    // static mut ENC_BANK_VAL: OnceCell<Mutex<I2cBank<Lpi2c3>>> = OnceCell::new();
 
     #[init(local = [
         ep_memory: EndpointMemory<1024> = EndpointMemory::new(),
@@ -102,6 +156,7 @@ mod app {
             mut gpio2,
             pins,
             usb,
+            lpi2c3,
             ..
         } = board::t40(cx.device);
         let led = board::led(&mut gpio2, pins.p13);
@@ -142,6 +197,38 @@ mod app {
             rtic_monotonics::create_systick_token!(),
         );
 
+        let i2c3: Lpi2c3 = lpi2c(lpi2c3, pins.p16, pins.p17, board::Lpi2cClockSpeed::KHz400);
+        let mi2c = MultiplexedI2c::new(i2c3).unwrap();
+        static I2C_BUS: StaticCell<I2cBus<Lpi2c3>> = StaticCell::new();
+        let i2c_bus = I2C_BUS.init(Mutex::new(RefCell::new(mi2c)));
+
+        static ENC_BANK: StaticCell<I2cBankBus<Lpi2c3>> = StaticCell::new();
+        let enc_bank = ENC_BANK.init(Mutex::new(RefCell::new(I2cBank {
+            start: 0,
+            len: 5,
+            active: 0,
+            i2c: i2c_bus
+        })));
+
+        // let mi2c = unsafe { MI2C_VAL.get_or_init(|| {
+        //     Mutex::new(MultiplexedI2c::new(i2c3).unwrap())
+        // })};
+
+        // mi2c.replace(Some(MultiplexedI2c::new(i2c3).unwrap()));
+        // let mi2c = MultiplexedI2c::new(i2c3).unwrap();
+        // let enc_bank: &_ = unsafe { ENC_BANK_VAL.get_or_init(|| Mutex::new())};
+
+        
+        // let bank2: I2cBank<teensy4_bsp::hal::lpi2c::Lpi2c<teensy4_bsp::hal::lpi2c::Pins<teensy4_bsp::hal::iomuxc::Pad<_, _>, teensy4_bsp::hal::iomuxc::Pad<_, _>>, 3>> = I2cBank {
+        //     start: 0,
+        //     len: 8,
+        //     active:0,
+        //     i2c: i2c_bus
+        // };
+        let param_encs: [_; 4] = core::array::from_fn(|i: usize| EncoderAS5600::new(enc_bank, i.try_into().unwrap(), None).unwrap());
+        let ctrl_enc = EncoderAS5600::new(enc_bank, 4, Some(24)).unwrap();
+
+
         blink::spawn().unwrap();
 
         (Shared {}, Local {
@@ -149,7 +236,9 @@ mod app {
             serial_class,
             midi_class,
             usb_device,
-            defmt_consumer
+            defmt_consumer,
+            param_encs,
+            ctrl_enc
         })
     }
 
