@@ -53,7 +53,6 @@ mod app {
         gpt::{Instance::Gpt0, Mode},
         BusAdapter, EndpointMemory, EndpointState, Speed
     }};
-    // use teensy4_bsp as bsp;
     use teensy4_bsp::board;
 
     use usb_device::{
@@ -61,11 +60,11 @@ mod app {
         device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbVidPid}
     };
     use usbd_serial::{CustomControlRequestHandler, SerialPort};
-    use usbd_midi::midi_device::MidiClass;
+    use usbd_midi::{data::{byte::{from_traits::FromClamped, u7::U7}, midi::{channel::Channel, message::{control_function::ControlFunction, Message}}, usb_midi::{cable_number::CableNumber, usb_midi_event_packet::UsbMidiEventPacket}}, midi_device::MidiClass};
 
     use defmt_bbq::DefmtConsumer;
 
-    use rtic_monotonics::systick::{Systick, *};
+    use rtic_monotonics::{systick::{Systick, *}, Monotonic};
 
     // sure
     use core::{cell::RefCell, sync::atomic::{AtomicU32, Ordering}};
@@ -86,65 +85,19 @@ mod app {
     }
 
     #[shared]
-    struct Shared {}
+    struct Shared {
+        midi_class: MidiClass<'static, BusAdapter>
+    }
 
     #[local]
     struct Local {
         serial_class: SerialPort<'static, BusAdapter, RebootRequestHandler>,
-        midi_class: MidiClass<'static, BusAdapter>,
         usb_device: UsbDevice<'static, BusAdapter>,
         defmt_consumer: DefmtConsumer,
         led: board::Led,
         ctrl_enc: EncoderAS5600<Lpi2c3>,
         param_encs: [EncoderAS5600<Lpi2c3>; 4]
     }
-
-    // struct UnsafeRefCell<T>(core::cell::RefCell<T>);
-    // unsafe impl<T> Send for UnsafeRefCell<T> {}
-    // unsafe impl<T> Sync for UnsafeRefCell<T> {}    
-    // impl<T> core::ops::Deref for UnsafeRefCell<T> {
-    //     type Target = RefCell<T>;
-    //     fn deref(&self) -> &Self::Target {
-    //         &self.0
-    //     }
-    // }
-
-    // struct StaticRefCell<T>(core::cell::RefCell<Option<T>>);
-    // impl<T> StaticRefCell<T> {
-    //     pub fn new() -> StaticRefCell<T> {
-    //         StaticRefCell(RefCell::new(None))
-    //     }
-    //     pub fn init(&self, v: T) {
-    //         self.0.replace(Some(v));
-    //     }
-    // }
-    // impl<T> core::ops::Deref for StaticRefCell<T> {
-    //     type Target = core::cell::RefCell<T>;
-    //     fn deref(&self) -> &Self::Target {
-
-    //     }
-    // }
-
-    // struct MaybeUninitSyncUnsafe<T>(MaybeUninit<T>);
-    // unsafe impl<T> Sync for MaybeUninitSyncUnsafe<T> {}
-    // impl<T> core::ops::Deref for MaybeUninitSyncUnsafe<T> {
-    //     type Target = MaybeUninit<T>;
-    //     fn deref(&self) -> &Self::Target {
-    //         &self.0
-    //     }
-    // }
-    // impl<T> core::ops::DerefMut for MaybeUninitSyncUnsafe<T> {
-    //     fn deref_mut(&mut self) -> &mut Self::Target {
-    //         &mut self.0
-    //     }
-    // }
-
-
-    // static mut MI2C_VAL: MaybeUninitSyncUnsafe<Mutex<MultiplexedI2c<Lpi2c3>>> = MaybeUninitSyncUnsafe(MaybeUninit::uninit());
-    // static mi2c: Onc<Option<MultiplexedI2c<Lpi2c3>>> = UnsafeRefCell(RefCell::new(None));
-
-    // static mut MI2C_VAL: OnceCell<Mutex<MultiplexedI2c<Lpi2c3>>> = OnceCell::new();
-    // static mut ENC_BANK_VAL: OnceCell<Mutex<I2cBank<Lpi2c3>>> = OnceCell::new();
 
     #[init(local = [
         ep_memory: EndpointMemory<1024> = EndpointMemory::new(),
@@ -209,32 +162,17 @@ mod app {
             active: 0,
             i2c: i2c_bus
         })));
-
-        // let mi2c = unsafe { MI2C_VAL.get_or_init(|| {
-        //     Mutex::new(MultiplexedI2c::new(i2c3).unwrap())
-        // })};
-
-        // mi2c.replace(Some(MultiplexedI2c::new(i2c3).unwrap()));
-        // let mi2c = MultiplexedI2c::new(i2c3).unwrap();
-        // let enc_bank: &_ = unsafe { ENC_BANK_VAL.get_or_init(|| Mutex::new())};
-
         
-        // let bank2: I2cBank<teensy4_bsp::hal::lpi2c::Lpi2c<teensy4_bsp::hal::lpi2c::Pins<teensy4_bsp::hal::iomuxc::Pad<_, _>, teensy4_bsp::hal::iomuxc::Pad<_, _>>, 3>> = I2cBank {
-        //     start: 0,
-        //     len: 8,
-        //     active:0,
-        //     i2c: i2c_bus
-        // };
         let param_encs: [_; 4] = core::array::from_fn(|i: usize| EncoderAS5600::new(enc_bank, i.try_into().unwrap(), None).unwrap());
         let ctrl_enc = EncoderAS5600::new(enc_bank, 4, Some(24)).unwrap();
 
-
         blink::spawn().unwrap();
 
-        (Shared {}, Local {
+        (Shared {
+            midi_class
+        }, Local {
             led,
             serial_class,
-            midi_class,
             usb_device,
             defmt_consumer,
             param_encs,
@@ -261,15 +199,62 @@ mod app {
         }
     }
 
+    #[task(shared = [midi_class], local = [param_encs, ctrl_enc])]
+    async fn process_param_encs(mut cx: process_param_encs::Context) {
+        let process_param_encs::LocalResources {
+            param_encs,
+            ctrl_enc,
+            ..
+        } = cx.local;
+        loop {
+            let start = Systick::now();
+
+            for e in param_encs.iter_mut() {
+                match e.process() {
+                    Ok(n) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let cable_number = CableNumber::Cable0;
+                        let channel = Channel::Channel1;
+                        // relative encoder: send 63 if decrement, 65 if increment
+                        // todo: repeat messages
+                        let message = Message::ControlChange(
+                            channel,
+                            ControlFunction(U7::from_clamped(20 + e.index)),
+                            U7::from_clamped(if n > 0 { 65 } else { 63 })
+                        );
+                        let packet = UsbMidiEventPacket::from_midi(cable_number, message);
+                        let _ = cx.shared.midi_class.lock(|midi_class| {
+                            midi_class.send_message(packet)
+                        }).inspect_err(|e| {
+                            defmt::error!("Failed to send MIDI packet {:?}", e);
+                        });
+                    },
+                    Err(_e) => defmt::error!("Failed to communicate with encoder")
+                }
+            }
+
+            match ctrl_enc.process() {
+                Ok(n) => {
+                    if n == 0 { continue; }
+                    defmt::info!("ctrl enc {=i16}", n);
+                },
+                Err(_e) => defmt::error!("Failed to communicate with ctrl encoder")
+            }
+
+            Systick::delay_until(start + 2.millis()).await;
+        }
+    }
+
     // remove defmt data from queue and send to usb host
-    #[task(binds = USB_OTG1, local = [
-        serial_class, midi_class, usb_device, defmt_consumer,
+    #[task(binds = USB_OTG1, shared = [midi_class], local = [
+        serial_class, usb_device, defmt_consumer,
         configured: bool = false
     ])]
-    fn usb_interrupt(cx: usb_interrupt::Context) {
+    fn usb_interrupt(mut cx: usb_interrupt::Context) {
         let usb_interrupt::LocalResources {
             serial_class,
-            midi_class,
             usb_device,
             defmt_consumer,
             configured,
@@ -282,30 +267,32 @@ mod app {
             }
         });
 
-        if usb_device.poll(&mut [serial_class, midi_class]) {
-            if usb_device.state() == UsbDeviceState::Configured {
-                // first configuration?
-                if !*configured {
-                    usb_device.bus().configure();
+        cx.shared.midi_class.lock(|midi_class| {
+            if usb_device.poll(&mut [serial_class, midi_class]) {
+                if usb_device.state() == UsbDeviceState::Configured {
+                    // first configuration?
+                    if !*configured {
+                        usb_device.bus().configure();
+                    }
+                    *configured = true;
+    
+                    // rebootor
+                    let mut buffer = [0; 64];
+                    match serial_class.read(&mut buffer) {
+                        Ok(count) => {
+                            // led.toggle();
+                            serial_class.write(&buffer[..count]).ok();
+                            serial_class.write(&buffer[..count]).ok();
+                        },
+                        Err(usb_device::UsbError::WouldBlock) => {}
+                        Err(err) => defmt::error!("{:?}", err)
+                    }
+                } else {
+                    // might have lost our configuration!
+                    *configured = false;
                 }
-                *configured = true;
-
-                // rebootor
-                let mut buffer = [0; 64];
-                match serial_class.read(&mut buffer) {
-                    Ok(count) => {
-                        // led.toggle();
-                        serial_class.write(&buffer[..count]).ok();
-                        serial_class.write(&buffer[..count]).ok();
-                    },
-                    Err(usb_device::UsbError::WouldBlock) => {}
-                    Err(err) => defmt::error!("{:?}", err)
-                }
-            } else {
-                // might have lost our configuration!
-                *configured = false;
-            }
-        }
+            }    
+        });
 
         // TODO: midi
         if *configured {

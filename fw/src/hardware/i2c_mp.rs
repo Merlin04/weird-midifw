@@ -43,17 +43,16 @@ impl<I2C: I2c> MultiplexedI2c<I2C> {
     }
 }
 
-pub type I2cBus<I2C: I2c> = Mutex<RefCell<MultiplexedI2c<I2C>>>;
+pub type I2cBus<I2C> = Mutex<RefCell<MultiplexedI2c<I2C>>>;
 
 pub struct I2cBank<I2C: I2c + 'static> {
     pub start: u8,
     pub len: u8,
     pub active: u8,
     pub i2c: &'static I2cBus<I2C>
-    // &'static Mutex<MultiplexedI2c<I2C>>
 }
 
-pub type I2cBankBus<I2C: I2c> = Mutex<RefCell<I2cBank<I2C>>>;
+pub type I2cBankBus<I2C> = Mutex<RefCell<I2cBank<I2C>>>;
 
 impl<I2C: I2c> core::ops::Deref for I2cBank<I2C> {
     type Target = I2cBus<I2C>;
@@ -61,11 +60,6 @@ impl<I2C: I2c> core::ops::Deref for I2cBank<I2C> {
         &self.i2c
     }
 }
-// impl<I2C: I2c> core::ops::DerefMut for I2cBank<I2C> {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         &mut self.i2c
-//     }
-// }
 
 pub fn with_i2c<I2C: I2c, I: 'static, T, F: FnOnce(&mut I, CriticalSection<'_>) -> Result<T, I2C::Error>>(
     bus: &Mutex<RefCell<I>>, f: F
@@ -78,9 +72,6 @@ pub fn with_i2c<I2C: I2c, I: 'static, T, F: FnOnce(&mut I, CriticalSection<'_>) 
 
 impl<I2C: I2c> I2cBank<I2C> {
     pub fn select(&mut self, index: u8) -> Result<(), I2C::Error> {
-        // for i in self.start..(self.start + self.len) {
-            // self.i2c.tca_set(i, i == index)
-        // }
         with_i2c::<I2C, _, _, _>(&self.i2c, |i2c: &mut MultiplexedI2c<I2C>, _| {
             i2c.tca_set(self.start + self.active, false)?;
             i2c.tca_set(self.start + index, true)?;
