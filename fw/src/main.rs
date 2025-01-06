@@ -1,58 +1,24 @@
-//! The starter code slowly blinks the LED and sets up
-//! USB logging. It periodically logs messages over USB.
-//!
-//! Despite targeting the Teensy 4.0, this starter code
-//! should also work on the Teensy 4.1 and Teensy MicroMod.
-//! You should eventually target your board! See inline notes.
-//!
-//! This template uses [RTIC v2](https://rtic.rs/2/book/en/)
-//! for structuring the application.
-
 #![no_std]
 #![no_main]
 
 mod hardware;
-
-use core::arch::asm;
-use teensy4_bsp::ral;
+mod velocity;
+mod bootloader;
 
 use teensy4_panic as _;
 
-fn reboot_into_bootloader() -> ! {
-    let cfg5 = unsafe { ral::read_reg!(ral::ocotp, ral::ocotp::OCOTP, CFG5) };
-    if (cfg5 & 0x02) == 0 {
-        unsafe {
-            asm!("bkpt #251"); // invoke the ancient wisdom of Paul Stoffregen
-            // https://github.com/PaulStoffregen/cores/blob/058d2808187a24e7db53803b7510e26827064c03/teensy4/usb.c#L214C3-L214C20
-        }
-        panic!("tried to jump to bootloader but failed!");
-    } else {
-        panic!("jump to bootloader when secure mode is enabled is unimplemented");
-        // disable irq?? idk how
-        // ?????
-        // unsafe {
-        //     ral::write_reg!(ral::usb, ral::usb::USB1, USBCMD, 0);
-        //     ral::write_reg!(ral::iomuxc_gpr, ral::iomuxc_gpr::GPR16, 0x00200003);
-
-
-        //     let first_address = core::ptr::read_volatile(0x0020001C as *const u32);
-        //     let function_address = core::ptr::read_volatile((first_address + 8) as *const u32);
-        //     let code: extern "C" fn(*const u32) = core::mem::transmute(function_address as *const ());
-        //     (code)(5);
-        //     panic!("yeah");
-        // }
-    }
-}
-
-#[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [KPP])]
+#[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [KPP, ENET2])]
 mod app {
     use critical_section::Mutex;
-    use crate::hardware::i2c_mp::I2cBankBus;
+    use fugit::Instant;
+    use crate::{bootloader::reboot_into_bootloader, hardware::matrix_pins::KeyType};
+    use rtic_sync::{channel::Receiver, make_channel};
+    use crate::{hardware::{i2c_mp::I2cBankBus, debounce::Debounce, matrix_pins::{disable_matrix_interrupts, enable_matrix_interrupts, key_type, MatrixInPins, MatrixInPinsExt, MatrixOutPins, MatrixOutPinsExt, N_COLS, N_ROWS}}, velocity::{self, Key, KeyEvent, KEY_EVENT_CAPACITY}};
     use static_cell::StaticCell;
-    use teensy4_bsp::{board::{lpi2c, Lpi2c3}, hal::usbd::{
+    use teensy4_bsp::{board::{lpi2c, Lpi2c3}, hal::{gpio::Port, usbd::{
         gpt::{Instance::Gpt0, Mode},
         BusAdapter, EndpointMemory, EndpointState, Speed
-    }};
+    }}, ral};
     use teensy4_bsp::board;
 
     use usb_device::{
@@ -67,7 +33,7 @@ mod app {
     use rtic_monotonics::{systick::{Systick, *}, Monotonic};
 
     // sure
-    use core::{cell::RefCell, sync::atomic::{AtomicU32, Ordering}};
+    use core::{array, cell::RefCell, sync::atomic::{AtomicU32, Ordering}};
 
     use crate::{hardware::{encoder::EncoderAS5600, i2c_mp::{I2cBank, I2cBus, MultiplexedI2c}}, reboot_into_bootloader};
     static COUNT: AtomicU32 = AtomicU32::new(0);
@@ -86,8 +52,17 @@ mod app {
 
     #[shared]
     struct Shared {
-        midi_class: MidiClass<'static, BusAdapter>
+        midi_class: MidiClass<'static, BusAdapter>,
+        gpio1: Port<1>,
+        gpio2: Port<2>,
+        matrix_in_pins: MatrixInPins,
+        matrix_out_pins: MatrixOutPins,
+        matrix_velocity: MatrixVelocity,
+        kscan_scan_time: Instant<u32, 1, 10000>
     }
+
+    type MatrixDebounce = [[Debounce; N_ROWS]; N_COLS];
+    type MatrixVelocity = [[velocity::Key; N_ROWS]; N_COLS];
 
     #[local]
     struct Local {
@@ -96,7 +71,9 @@ mod app {
         defmt_consumer: DefmtConsumer,
         led: board::Led,
         ctrl_enc: EncoderAS5600<Lpi2c3>,
-        param_encs: [EncoderAS5600<Lpi2c3>; 4]
+        param_encs: [EncoderAS5600<Lpi2c3>; 4],
+        matrix_debounce: MatrixDebounce,
+        key_receiver: Receiver<'static, KeyEvent, KEY_EVENT_CAPACITY>
     }
 
     #[init(local = [
@@ -106,12 +83,15 @@ mod app {
     ])]
     fn init(cx: init::Context) -> (Shared, Local) {
         let board::Resources {
+            mut gpio1,
             mut gpio2,
+            mut gpio3,
+            mut gpio4,
             pins,
             usb,
             lpi2c3,
             ..
-        } = board::t40(cx.device);
+        } = board::t41(cx.device);
         let led = board::led(&mut gpio2, pins.p13);
         
         let bus_adapter = BusAdapter::with_speed(usb, cx.local.ep_memory, cx.local.ep_state, SPEED);
@@ -166,17 +146,58 @@ mod app {
         let param_encs: [_; 4] = core::array::from_fn(|i: usize| EncoderAS5600::new(enc_bank, i.try_into().unwrap(), None).unwrap());
         let ctrl_enc = EncoderAS5600::new(enc_bank, 4, Some(24)).unwrap();
 
+        // *screams*
+        let matrix_in_pins = (
+            gpio2.input(pins.p35), gpio2.input(pins.p36), gpio2.input(pins.p37),
+            gpio1.input(pins.p38), gpio1.input(pins.p39), gpio1.input(pins.p40),
+            gpio1.input(pins.p41), gpio1.input(pins.p14), gpio1.input(pins.p15),
+            gpio1.input(pins.p25), gpio1.input(pins.p24),
+            gpio2.input(pins.p12), gpio2.input(pins.p7)
+        );
+
+        enable_matrix_interrupts(&mut gpio1, &mut gpio2, &matrix_in_pins);
+
+        let matrix_out_pins: MatrixOutPins = (
+            gpio2.output(pins.p32),
+            gpio3.output(pins.p31), gpio3.output(pins.p30),
+            gpio4.output(pins.p29),
+            gpio3.output(pins.p28),
+            gpio1.output(pins.p27), gpio1.output(pins.p26),
+            gpio4.output(pins.p33),
+            gpio2.output(pins.p34)
+        );
+
         blink::spawn().unwrap();
 
+        let matrix_debounce: MatrixDebounce = array::from_fn(|_| array::from_fn(|_| Debounce(0)));
+
+        let (key_sender, key_receiver) = make_channel!(KeyEvent, KEY_EVENT_CAPACITY);
+        let start_timeout_callback = Mutex::new(RefCell::new(|row, col| {
+            // TODO - timeout handler???
+        }));
+        let matrix_velocity: MatrixVelocity = array::from_fn(|col| array::from_fn(|row|
+            velocity::Key::new(row.try_into().unwrap(), col.try_into().unwrap(), key_sender.clone(), &start_timeout_callback
+        )));
+
+        kscan_matrix_read::spawn(0).unwrap();
+
         (Shared {
-            midi_class
+            midi_class,
+            gpio1,
+            gpio2,
+            matrix_in_pins,
+            matrix_out_pins,
+            matrix_velocity,
+            kscan_scan_time: Systick::now()
         }, Local {
             led,
             serial_class,
             usb_device,
             defmt_consumer,
             param_encs,
-            ctrl_enc
+            ctrl_enc,
+            matrix_debounce,
+            key_receiver
         })
     }
 
@@ -199,7 +220,19 @@ mod app {
         }
     }
 
-    #[task(shared = [midi_class], local = [param_encs, ctrl_enc])]
+    #[task(priority = 1, shared = [midi_class], local = [key_receiver])]
+    async fn process_key_events(cx: process_key_events::Context) {
+        let process_key_events::LocalResources {
+            key_receiver,
+            ..
+        } = cx.local;
+
+        while let Ok(val) = key_receiver.recv().await {
+
+        }
+    }
+
+    #[task(priority = 1, shared = [midi_class], local = [param_encs, ctrl_enc])]
     async fn process_param_encs(mut cx: process_param_encs::Context) {
         let process_param_encs::LocalResources {
             param_encs,
@@ -218,15 +251,16 @@ mod app {
                         let cable_number = CableNumber::Cable0;
                         let channel = Channel::Channel1;
                         // relative encoder: send 63 if decrement, 65 if increment
-                        // todo: repeat messages
-                        let message = Message::ControlChange(
-                            channel,
-                            ControlFunction(U7::from_clamped(20 + e.index)),
-                            U7::from_clamped(if n > 0 { 65 } else { 63 })
-                        );
-                        let packet = UsbMidiEventPacket::from_midi(cable_number, message);
-                        let _ = cx.shared.midi_class.lock(|midi_class| {
-                            midi_class.send_message(packet)
+                        let _ = (0..(n.abs())).fold::<Result<(), usb_device::UsbError>, _>(Ok(()), |acc, _| {
+                            let message = Message::ControlChange(
+                                channel,
+                                ControlFunction(U7::from_clamped(20 + e.index)),
+                                U7::from_clamped(if n > 0 { 65 } else { 63 })
+                            );    
+                            let packet = UsbMidiEventPacket::from_midi(cable_number, message);
+                            cx.shared.midi_class.lock(|midi_class| {
+                                midi_class.send_message(packet)
+                            }).and(acc)
                         }).inspect_err(|e| {
                             defmt::error!("Failed to send MIDI packet {:?}", e);
                         });
@@ -245,6 +279,152 @@ mod app {
 
             Systick::delay_until(start + 2.millis()).await;
         }
+    }
+
+    const KSCAN_DEBOUNCE_SCAN_PERIOD_MS: u32 = 1;
+    const KSCAN_COL_DELAY_US: u32 = 5;
+
+    #[task(priority = 2, shared = [gpio1, gpio2, matrix_in_pins, matrix_out_pins, matrix_velocity, kscan_scan_time], local = [matrix_debounce])]
+    async fn kscan_matrix_read(mut cx: kscan_matrix_read::Context, mut poll_counter: u8) {
+        let kscan_matrix_read::LocalResources {
+            matrix_debounce,
+            ..
+        } = cx.local;
+
+        // Scan the matrix.
+
+        loop {
+            Systick::delay(5.micros()).await; // hardware is so bad
+
+            let continue_scan = cx.shared.matrix_out_pins.lock(|matrix_out_pins| {
+                cx.shared.matrix_in_pins.lock(|matrix_in_pins| async {
+                    let outputs = matrix_out_pins.as_array();
+                    let inputs = matrix_in_pins.as_array();
+
+                    for out_idx in 0..outputs.len() {
+                        outputs[out_idx].set();
+                        
+                        for in_idx in 0..inputs.len() {
+                            if in_idx == 12 && out_idx < 2 {
+                                continue;
+                            }
+                            
+                            let active = inputs[in_idx].is_set(); // assume INPUT_PULLDOWN (active high)
+                            matrix_debounce[out_idx][in_idx].update(active, KSCAN_DEBOUNCE_SCAN_PERIOD_MS.into());
+                        }
+
+                        outputs[out_idx].clear();
+                        Systick::delay(KSCAN_COL_DELAY_US.micros()).await; // electron moment, I think this is waiting for the diode to switch?? unclear
+                    }
+
+                    // Process the new state.
+                    let mut continue_scan = poll_counter > 0; // sometimes an interrupt will be triggered but the switch will jitter a bit and seem like it wasn't pressed
+                    // but we know it was pressed, so continue even if the debouncer says nothing is active
+
+                    // iterate through all rows/cols, find the keys where debounce_get_changed, then callback
+                    // then continue_scan ||= debounce_is_active
+                    for out_idx in 0..outputs.len() {
+                        for in_idx in 0..inputs.len() {
+                            let debounce = matrix_debounce[out_idx][in_idx];
+                            if debounce.changed() {
+                                let pressed = debounce.pressed();
+                                // key event!
+
+                                let k_type = key_type(in_idx.try_into().unwrap(), out_idx.try_into().unwrap());
+                                if k_type == KeyType::Ctrl {
+                                    // TODO: handle ctrl key press
+                                } else {
+                                    cx.shared.matrix_velocity.lock(|matrix_velocity| {
+                                        use velocity::velocity_sense::Input;
+                                        matrix_velocity[out_idx][in_idx].process_event(if k_type == KeyType::Upper {
+                                            if pressed { Input::TopPress } else { Input::TopRelease }
+                                        } else {
+                                            if pressed { Input::BottomPress } else { Input::BottomRelease }
+                                        });
+                                    });
+                                }
+                            }
+                            continue_scan = continue_scan || debounce.is_active();
+                        }
+                    }
+                    continue_scan
+                })
+            }).await;
+
+            if continue_scan {
+                // At least one key is pressed or the debouncer has not yet decided if
+                // it is pressed. Poll quickly until everything is released.
+                // kscan_scan_time += KSCAN_DEBOUNCE_SCAN_PERIOD_MS * 1000; // microseconds
+                let run_at = cx.shared.kscan_scan_time.lock(|ksc| {
+                    *ksc += KSCAN_DEBOUNCE_SCAN_PERIOD_MS.millis();
+                    *ksc
+                });
+
+                if poll_counter > 0 {
+                    poll_counter -= 1;
+                }
+
+                Systick::delay_until(run_at).await;
+                // matrix_scheduler.schedule_at(kscan_scan_time, micros(), poll_counter == 0 ? 0 : poll_counter - 1);
+            } else {
+                // All keys are released. Return to normal.
+                // Return to waiting for an interrupt.
+                cx.shared.gpio1.lock(|gpio1| {
+                    cx.shared.gpio2.lock(|gpio2| {
+                        cx.shared.matrix_in_pins.lock(|matrix_in_pins| {
+                            enable_matrix_interrupts(gpio1, gpio2, matrix_in_pins);
+                        })
+                    })
+                });
+                break;
+            }
+        }
+    }
+
+    fn handle_gpio_interrupt(
+        mut gpio1: shared_resources::gpio1_that_needs_to_be_locked,
+        mut gpio2: shared_resources::gpio2_that_needs_to_be_locked,
+        mut matrix_in_pins: shared_resources::matrix_in_pins_that_needs_to_be_locked,
+        mut kscan_scan_time: shared_resources::kscan_scan_time_that_needs_to_be_locked
+    ) {
+        use rtic::Mutex;
+        // Disable our interrupts temporarily to avoid re-entry while we scan.
+        gpio1.lock(|gpio1| {
+            gpio2.lock(|gpio2| {
+                matrix_in_pins.lock(|matrix_in_pins| {
+                    disable_matrix_interrupts(gpio1, gpio2, matrix_in_pins);
+                });
+                unsafe {
+                    ral::write_reg!(ral::gpio, ral::gpio::GPIO1, ISR, 0);
+                    ral::write_reg!(ral::gpio, ral::gpio::GPIO2, ISR, 0);
+                }
+            })
+        });
+        kscan_scan_time.lock(|ksc| {
+            *ksc = Systick::now();
+        });
+
+        kscan_matrix_read::spawn(5).unwrap(); // start polling for a bit to try to catch everything
+    }
+
+    #[task(binds = GPIO1_COMBINED_0_15, shared = [gpio1, gpio2, matrix_in_pins, kscan_scan_time])]
+    fn interrupt_gpio1_0_15(cx: interrupt_gpio1_0_15::Context) {
+        handle_gpio_interrupt(cx.shared.gpio1, cx.shared.gpio2, cx.shared.matrix_in_pins, cx.shared.kscan_scan_time);
+    }
+
+    #[task(binds = GPIO1_COMBINED_16_31, shared = [gpio1, gpio2, matrix_in_pins, kscan_scan_time])]
+    fn interrupt_gpio1_16_31(cx: interrupt_gpio1_16_31::Context) {
+        handle_gpio_interrupt(cx.shared.gpio1, cx.shared.gpio2, cx.shared.matrix_in_pins, cx.shared.kscan_scan_time);
+    }
+
+    #[task(binds = GPIO2_COMBINED_0_15, shared = [gpio1, gpio2, matrix_in_pins, kscan_scan_time])]
+    fn interrupt_gpio2_0_15(cx: interrupt_gpio2_0_15::Context) {
+        handle_gpio_interrupt(cx.shared.gpio1, cx.shared.gpio2, cx.shared.matrix_in_pins, cx.shared.kscan_scan_time);
+    }
+
+    #[task(binds = GPIO2_COMBINED_16_31, shared = [gpio1, gpio2, matrix_in_pins, kscan_scan_time])]
+    fn interrupt_gpio2_16_31(cx: interrupt_gpio2_16_31::Context) {
+        handle_gpio_interrupt(cx.shared.gpio1, cx.shared.gpio2, cx.shared.matrix_in_pins, cx.shared.kscan_scan_time);
     }
 
     // remove defmt data from queue and send to usb host
