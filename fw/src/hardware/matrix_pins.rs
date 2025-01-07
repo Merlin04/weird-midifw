@@ -1,7 +1,15 @@
 use teensy4_bsp::{hal::gpio::{Input, Output, Port, Trigger::RisingEdge}, pins};
 
+use crate::utils::create_trait;
+
+// the actual grid of keys is 9*6
+// 6*2 rows + 1 for ctrl keys
 pub const N_ROWS: usize = 13;
+// 9 cols
 pub const N_COLS: usize = 9;
+
+pub const N_OUTPUTS: usize = N_COLS;
+pub const N_INPUTS: usize = N_ROWS;
 
 type MatrixIn0 = Input<pins::t41::P35>;
 type MatrixIn1 = Input<pins::t41::P36>;
@@ -30,24 +38,6 @@ type MatrixOut7 = Output<pins::t41::P33>;
 type MatrixOut8 = Output<pins::t41::P34>;
 
 pub type MatrixOutPins = (MatrixOut0, MatrixOut1, MatrixOut2, MatrixOut3, MatrixOut4, MatrixOut5, MatrixOut6, MatrixOut7, MatrixOut8);
-
-macro_rules! create_trait {
-    ($struct_name:ident < $($generics:ident),+ >, $trait_name:ident, {
-        $(fn $method_name:ident($($param_name:ident: $param_type:ty),*) -> $ret_type:ty;)*
-    }) => {
-        pub trait $trait_name {
-            $(fn $method_name(&self, $($param_name: $param_type),*) -> $ret_type;)*
-        }
-
-        impl<$($generics),+> $trait_name for $struct_name<$($generics),+> {
-            $(
-                fn $method_name(&self, $($param_name: $param_type),*) -> $ret_type {
-                    self.$method_name($($param_name),*)
-                }
-            )*
-        }
-    };
-}
 
 create_trait!(Input<P>, InputTrait, {
     fn is_set() -> bool;

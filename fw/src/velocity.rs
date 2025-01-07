@@ -1,11 +1,9 @@
-use core::cell::RefCell;
-
-use critical_section::Mutex;
-use fugit::Instant;
 use rtic_monotonics::{systick::{Systick, *}, Monotonic};
 use rtic_sync::channel::Sender;
 use rust_fsm::*;
 use velocity_sense::Output;
+
+use crate::utils::{RangeMappable, SystickInstant};
 
 state_machine! {
     #[derive(Debug)]
@@ -30,13 +28,11 @@ state_machine! {
         BottomPress => ExtraBottomPressed [SendNoteOn],
         TopRelease => Initial
     },
-    ExtraBottomReleased(BottomPress) => BottomReleased [SendNoteOff]
+    ExtraBottomPressed(BottomRelease) => BottomReleased [SendNoteOff]
 }
 
-const VELOCITY_DEFAULT: u8 = 127;
-const VELOCITY_SOFT: u8 = 64;
-
-const PRESS_TIMEOUT: u32 = 30;
+const VELOCITY_DEFAULT: u8 = 200;
+const VELOCITY_SOFT: u8 = 100;
 
 #[derive(Debug)]
 pub struct KeyEvent {
@@ -49,16 +45,18 @@ pub struct KeyEvent {
 pub const KEY_EVENT_CAPACITY: usize = 20; // ??
 type KeyEventSender = Sender<'static, KeyEvent, KEY_EVENT_CAPACITY>;
 
-pub struct Key/*<F> where F: FnMut(u8, u8) -> ()*/ {
+const VELOCITY_TIMEOUT_MILLIS: u32 = 100;
+
+pub struct Key {
     machine: velocity_sense::StateMachine,
     pub row: u8,
     pub col: u8,
     velocity: u8,
-    top_press_time: Instant<u32, 1, 1000>, // return type of Systick::now
+    top_press_time: SystickInstant,
     sender: KeyEventSender,
-    start_timeout_callback: &'static Mutex<RefCell<&'static mut dyn FnMut(u8, u8) -> ()>>
+    pub timeout_on: Option<SystickInstant>
 }
-impl/*<F>*/ Key/*<F> where F: FnMut(u8, u8) -> ()*/ {
+impl Key {
     async fn send_event(&mut self, on: bool) {
         self.sender.send(KeyEvent {
             row: self.row,
@@ -71,9 +69,20 @@ impl/*<F>*/ Key/*<F> where F: FnMut(u8, u8) -> ()*/ {
         self.velocity = VELOCITY_SOFT;
     }
     fn calc_velocity(&mut self) {
-
+        self.timeout_on = None;
+        let delay = Systick::now() - self.top_press_time;
+        // rough velocity curve
+        // similar to melodicade mx
+        // TODO: test this and adjust as necessary
+        self.velocity = f64::from(delay.to_millis()).map_range_array([
+            (8., 255.),
+            (20., 220.),
+            (50., 188.),
+            (100., 150.)
+        ]) as u8;
     }
     async fn top_tap(&mut self) {
+        self.timeout_on = None;
         self.velocity = VELOCITY_DEFAULT;
         self.send_event(true).await;
         self.send_event(false).await; // TODO does this actually work?
@@ -82,12 +91,7 @@ impl/*<F>*/ Key/*<F> where F: FnMut(u8, u8) -> ()*/ {
         // record top press time
         self.top_press_time = Systick::now();
         // start timeout
-        // unsure if this is the best way to do this?
-        // (self.start_timeout_callback)(self.row, self.col);
-        critical_section::with(|cs| {
-            let start_timeout_callback = &mut *self.start_timeout_callback.borrow_ref_mut(cs);
-            start_timeout_callback(self.row, self.col);
-        });
+        self.timeout_on = Some(self.top_press_time + VELOCITY_TIMEOUT_MILLIS.millis());
     }
     
     pub async fn process_event(&mut self, event: velocity_sense::Input) {
@@ -113,7 +117,7 @@ impl/*<F>*/ Key/*<F> where F: FnMut(u8, u8) -> ()*/ {
 
     }
 
-    pub fn new(row: u8, col: u8, sender: KeyEventSender, start_timeout_callback: &'static Mutex<RefCell<&mut dyn FnMut(u8, u8)>>) -> Self {
+    pub fn new(row: u8, col: u8, sender: KeyEventSender) -> Self {
         Key {
             machine: velocity_sense::StateMachine::new(),
             row,
@@ -121,7 +125,7 @@ impl/*<F>*/ Key/*<F> where F: FnMut(u8, u8) -> ()*/ {
             velocity: 0,
             top_press_time: Systick::now(),
             sender,
-            start_timeout_callback
+            timeout_on: None
         }
     }
 }
